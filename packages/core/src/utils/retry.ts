@@ -15,17 +15,13 @@ import {
 import { delay, createAbortError } from './delay.js';
 import { debugLogger } from './debugLogger.js';
 import { getErrorStatus, ModelNotFoundError } from './httpErrors.js';
-import type { ModelAvailabilityService } from '../availability/modelAvailabilityService.js';
-import type { ModelPolicy } from '../availability/modelPolicy.js';
+import type { RetryAvailabilityContext } from '../availability/modelPolicy.js';
 import { classifyFailureKind } from '../availability/errorClassification.js';
 
 const FETCH_FAILED_MESSAGE =
   'exception TypeError: fetch failed sending request';
 
-export interface RetryAvailabilityContext {
-  service: ModelAvailabilityService;
-  policy: ModelPolicy;
-}
+export type { RetryAvailabilityContext };
 
 export interface RetryOptions {
   maxAttempts: number;
@@ -146,12 +142,6 @@ export async function retryWithBackoff<T>(
         continue;
       }
 
-      // If successful, and we were using a sticky retry, assume it was consumed.
-      // However, BaseLlmClient currently manages this by simply succeeding.
-      // The `ModelAvailabilityService.consumeStickyAttempt` is handled by the caller (selectFirstAvailable)
-      // or here if we wanted to be strict, but the caller usually calls selectFirstAvailable
-      // which notes if it's a sticky attempt.
-      // Actually, if we succeed, we don't need to do anything with availability here.
       return result;
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
@@ -160,35 +150,25 @@ export async function retryWithBackoff<T>(
 
       const classifiedError = classifyGoogleError(error);
 
-      // --- Availability Logic Integration ---
-
       if (getAvailabilityContext) {
         const context = getAvailabilityContext();
 
         if (context) {
           const failureKind = classifyFailureKind(classifiedError);
-
           const transition = context.policy.stateTransitions?.[failureKind];
 
           if (transition) {
             const { service, policy } = context;
+            // Do not throw any errors. Handled later on by onPersistent429
             if (transition === 'terminal') {
-              // Map failure kinds to service reasons.
-              // 'terminal' kind (Quota) -> 'quota'.
+              // 'terminal'  -> 'quota'.
               // 'not_found' / 'unknown' -> 'capacity' (generic unavailability).
               service.markTerminal(
                 policy.model,
                 failureKind === 'terminal' ? 'quota' : 'capacity',
               );
-              // We do NOT throw here. We allow the flow to proceed to the
-              // TerminalQuotaError/ModelNotFoundError check below, which handles
-              // calling the fallback handler (onPersistent429).
             } else if (transition === 'sticky_retry') {
               service.markRetryOncePerTurn(policy.model);
-              // Sticky retry means "failed for this turn, try again next turn".
-              // For the *current* request, this is effectively a failure that
-              // should trigger a fallback if possible.
-              // We treat it similarly to terminal: don't throw yet, let fallback handler decide.
             }
           }
         }
